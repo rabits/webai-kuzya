@@ -1,0 +1,7 @@
+fastapi>=0.111
+uvicorn[standard]>=0.29
+pydantic>=2.0
+numpy>=1.26,<2
+silero-stress>=0.1
+f5-tts>=1.1.0
+# torch/torchaudio are installed from the cu130 index in the Dockerfile.
