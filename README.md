@@ -6,7 +6,10 @@ Open WebUI in front of an external vLLM endpoint, with local Whisper STT and F5-
 Browser
    │
    ▼
-open-webui          CPU only, ~1 GB
+lb (nginx)          :80 → :443, TLS
+   │
+   ▼
+open-webui          127.0.0.1:3000, CPU only, ~1 GB
    ├── chat    →  vLLM on the host / another compose  (the large allocation)
    ├── STT     →  stt:8001   Whisper turbo on GPU     (~2 GB)
    └── TTS     →  tts:8002   F5-TTS on GPU            (~4 GB)
@@ -53,13 +56,27 @@ Do **not** use Open WebUI’s built-in Whisper or the `:cuda` WebUI image here. 
 ```bash
 cp .env.example .env
 # set LLM_URL / LLM_MODEL / WEBUI_SECRET_KEY
+# set WEBUI_URL to the public origin, e.g. https://example.com
 
 docker compose up -d --build
 ```
 
 First STT start downloads Whisper into `models/whisper/` (turbo is ~1.6 GB). TTS warmup needs `models/voices/default/ref.wav`.
 
-Open http://localhost:3000
+Open **https://localhost** (or your `WEBUI_URL`). HTTP on port 80 redirects to HTTPS. Open WebUI itself is bound to `127.0.0.1:3000` and is not published on the LAN.
+
+On first start nginx writes a self-signed cert into `certs/` for the host in `WEBUI_URL`. Browsers will warn until you accept it, or until you drop a real cert there:
+
+```bash
+# Let's Encrypt live directory, or any dir with these filenames
+# TLS_CERT_DIR=/etc/letsencrypt/live/example.com
+# TLS_CERT=fullchain.pem
+# TLS_KEY=privkey.pem
+```
+
+A non-443 port in `WEBUI_URL` (for example `https://example.com:8443`) is used in the redirect and in the cert marker. Nginx inside the container still listens on 443; map the host port in compose (`"8443:443"`) if you actually want that port on the host.
+
+Changing `WEBUI_URL` regenerates the self-signed pair only if `certs/.selfsigned-for` is present (i.e. nginx created the files). Your own certs are never overwritten. To force a new self-signed cert, delete `certs/*.pem` and `certs/.selfsigned-for` and recreate `lb`.
 
 If audio settings in the UI disagree with `.env` after the first launch, Open WebUI persisted them in its volume. Either set Admin → Settings → Audio, or recreate the `open-webui-data` volume.
 
@@ -70,7 +87,7 @@ chmod +x scripts/smoke.sh
 ./scripts/smoke.sh
 ```
 
-This checks `/health` on STT, TTS, and Open WebUI, then transcribes `models/voices/default/ref.wav` if it exists.
+This checks `/health` on STT, TTS, local WebUI, and HTTPS via nginx, then transcribes `models/voices/default/ref.wav` if it exists.
 
 Manual checks:
 
@@ -101,9 +118,11 @@ Then use the microphone / call controls in a chat against the vLLM model.
 
 ## Ports
 
-| Service | Port |
-| --- | --- |
-| Open WebUI | 3000 |
-| STT | 8001 |
-| TTS | 8002 |
-| vLLM (external) | 8000 by default |
+| Service | Port | Bind |
+| --- | --- | --- |
+| nginx HTTP → HTTPS | 80 | public |
+| nginx HTTPS | 443 | public |
+| Open WebUI | 3000 | `127.0.0.1` only |
+| STT | 8001 | host (docker network for WebUI) |
+| TTS | 8002 | host (docker network for WebUI) |
+| vLLM (external) | 8000 by default | |

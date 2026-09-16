@@ -2,3 +2,5 @@
 __pycache__
 /models/*
 !/models/README.md
+/certs/*
+!/certs/.gitkeep

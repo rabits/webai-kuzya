@@ -68,7 +68,7 @@ services:
   open-webui:
     image: ghcr.io/open-webui/open-webui:main
     ports:
-      - "${WEBUI_PORT:-3000}:8080"
+      - "${WEBUI_BIND:-127.0.0.1}:${WEBUI_PORT:-3000}:8080"
     env_file:
       - .env
     environment:
@@ -78,6 +78,8 @@ services:
       ENABLE_OPENAI_API: "true"
       OPENAI_API_BASE_URL: ${LLM_URL}
       OPENAI_API_KEY: ${LLM_API_KEY:-sk-local}
+      WEBUI_URL: ${WEBUI_URL:-https://localhost}
+      FORWARDED_ALLOW_IPS: "*"
       AUDIO_STT_ENGINE: openai
       AUDIO_STT_OPENAI_API_BASE_URL: ${STT_URL}
       AUDIO_STT_OPENAI_API_KEY: ${STT_API_KEY:-sk-local}
@@ -110,6 +112,30 @@ services:
           "-c",
           "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')",
         ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+
+  lb:
+    build: ./lb
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "443:443"
+    environment:
+      NVIDIA_VISIBLE_DEVICES: void
+      WEBUI_URL: ${WEBUI_URL:-https://localhost}
+      TLS_CERT: ${TLS_CERT:-fullchain.pem}
+      TLS_KEY: ${TLS_KEY:-privkey.pem}
+      TLS_DAYS: ${TLS_DAYS:-825}
+    volumes:
+      - ${TLS_CERT_DIR:-./certs}:/etc/nginx/certs
+    depends_on:
+      open-webui:
+        condition: service_started
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-skf", "https://127.0.0.1/health"]
       interval: 30s
       timeout: 10s
       retries: 5
