@@ -66,7 +66,8 @@ services:
       start_period: 8m
 
   open-webui:
-    image: ghcr.io/open-webui/open-webui:main
+    build: ./webui
+    image: kuzya-open-webui:local
     ports:
       - "${WEBUI_BIND:-127.0.0.1}:${WEBUI_PORT:-3000}:8080"
     env_file:

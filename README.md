@@ -53,6 +53,13 @@ Do **not** use Open WebUI’s built-in Whisper or the `:cuda` WebUI image here. 
 
 ## Run
 
+As LLM you can use any setup that supports OpenAI protocol. I use https://github.com/blazux/qwen3.8-Flash-DGX with model "lychee888/Qwen3.8-Flash-Next-Uncensored-NVFP4-FP8PLE":
+```
+$ MODEL=lychee888/Qwen3.8-Flash-Next-Uncensored-NVFP4-FP8PLE ./flash setup
+$ MODEL=lychee888/Qwen3.8-Flash-Next-Uncensored-NVFP4-FP8PLE ./flash serve published PORT=8000
+$ PORT=8000 ./flash wait
+```
+
 ```bash
 cp .env.example .env
 # set LLM_URL / LLM_MODEL / WEBUI_SECRET_KEY
@@ -63,7 +70,7 @@ docker compose up -d --build
 
 First STT start downloads Whisper into `models/whisper/` (turbo is ~1.6 GB). TTS warmup needs `models/voices/default/ref.wav`.
 
-Open **https://localhost** (or your `WEBUI_URL`). HTTP on port 80 redirects to HTTPS. Open WebUI itself is bound to `127.0.0.1:3000` and is not published on the LAN.
+Open **https://localhost** (or your `WEBUI_URL`). HTTP on port 80 redirects to HTTPS.
 
 On first start nginx writes a self-signed cert into `certs/` for the host in `WEBUI_URL`. Browsers will warn until you accept it, or until you drop a real cert there:
 
@@ -79,6 +86,10 @@ A non-443 port in `WEBUI_URL` (for example `https://example.com:8443`) is used i
 Changing `WEBUI_URL` regenerates the self-signed pair only if `certs/.selfsigned-for` is present (i.e. nginx created the files). Your own certs are never overwritten. To force a new self-signed cert, delete `certs/*.pem` and `certs/.selfsigned-for` and recreate `lb`.
 
 If audio settings in the UI disagree with `.env` after the first launch, Open WebUI persisted them in its volume. Either set Admin → Settings → Audio, or recreate the `open-webui-data` volume.
+
+### How to setup Kuzya
+
+Create new Workspace and specify system prompt from `system_prompt_kuzya.txt` and set voice to `kuzya_calm`, then save and pick it in your chat as the model.
 
 ## Smoke test
 
@@ -115,6 +126,20 @@ Admin → Settings → Audio should already be seeded from compose:
 - Split on punctuation (F5-TTS is happier with short clauses)
 
 Then use the microphone / call controls in a chat against the vLLM model.
+
+## Qwen 3.8 thinking options
+
+Open WebUI is built from `webui/Dockerfile`, which adds three Advanced Parameters (workspace model defaults and chat overrides):
+
+| Control | Sent to vLLM as |
+| --- | --- |
+| `enable_thinking` (Qwen) | `chat_template_kwargs.enable_thinking` bool |
+| `preserve_thinking` (Qwen) | `chat_template_kwargs.preserve_thinking` bool |
+| Reasoning Effort | `reasoning_effort`: `xhigh` → `medium` → `low` |
+
+Each control is Default / On / Off (or Default / xhigh / medium / low), same pattern as `keep_alive`. Default leaves the field out so vLLM uses its own defaults.
+
+First `docker compose up --build` rebuilds the Open WebUI frontend; later starts reuse `kuzya-open-webui:local`.
 
 ## Ports
 
