@@ -17,6 +17,8 @@ open-webui          127.0.0.1:3000, CPU only, ~1 GB
 
 vLLM is intentionally not in this compose file. It already owns most of the 128 GB unified memory; this stack only needs a reserved slice of it.
 
+The idea of f5-tts with stress marks I got from https://github.com/korenko-git/voice-service - thanks to Dmytro it works great!
+
 ## Why three containers, not one
 
 Docker itself is cheap: a few hundred MB of process overhead. What actually costs memory on GB10 is:
@@ -46,14 +48,31 @@ Do **not** use Open WebUI’s built-in Whisper or the `:cuda` WebUI image here. 
 
 ## Prerequisites
 
-- NVIDIA DGX Spark (GB10, aarch64, CUDA 13)
-- Docker with NVIDIA container toolkit (`deploy.resources` GPU reservations; do not set `runtime: nvidia` on DGX OS)
+NVIDIA (default):
+
+- DGX Spark (GB10, aarch64, CUDA 13) or any NVIDIA box with the NVIDIA Container Toolkit
+- Do not set `runtime: nvidia` on DGX OS; use `deploy.resources` GPU reservations
+
+AMD:
+
+- ROCm 7.2.x, `/dev/kfd` and `/dev/dri`, host groups `video` / `render`
+- `docker compose -f docker-compose.amd.yml` (see [AMD ROCm](#amd-rocm))
+
+Both:
+
 - F5-TTS files and a `default` voice as described in [models/README.md](models/README.md)
 - vLLM already serving an OpenAI-compatible API
 
 ## Run
 
-As LLM you can use any setup that supports OpenAI protocol. I use https://github.com/blazux/qwen3.8-Flash-DGX with model "lychee888/Qwen3.8-Flash-Next-Uncensored-NVFP4-FP8PLE":
+As LLM you can use any setup that supports OpenAI protocol. I use https://github.com/blazux/qwen3.8-Flash-DGX as vLLM:
+```
+$ ./flash setup
+$ ./flash serve PORT=8000
+$ PORT=8000 ./flash wait
+```
+
+**WARNING**: With default model it will run just fine on one DGX Spark, but with custom model it will not fit RAM. So with that I use second host for STT and TTS:
 ```
 $ MODEL=lychee888/Qwen3.8-Flash-Next-Uncensored-NVFP4-FP8PLE ./flash setup
 $ MODEL=lychee888/Qwen3.8-Flash-Next-Uncensored-NVFP4-FP8PLE ./flash serve published PORT=8000
@@ -65,8 +84,32 @@ cp .env.example .env
 # set LLM_URL / LLM_MODEL / WEBUI_SECRET_KEY
 # set WEBUI_URL to the public origin, e.g. https://example.com
 
-docker compose up -d --build
+docker compose -f docker-compose.nvidia.yml up -d --build
 ```
+
+## AMD ROCm
+
+GPU device wiring cannot be a `.env` switch: Compose merges `devices` / `deploy` instead of replacing them. Use the AMD compose file. Platform images and torch indexes live in that file, not in `.env`.
+
+```bash
+docker compose -f docker-compose.amd.yml build --no-cache stt tts
+docker compose -f docker-compose.amd.yml up -d --build
+```
+
+`--no-cache` is needed if an earlier AMD build left CUDA torch in the image: `whisper` / `f5-tts` pull `torch` from PyPI, which is a `+cu*` wheel. The Dockerfiles now install the ROCm wheel first and force-reinstall it after requirements.
+
+That builds `kuzya-stt:rocm` / `kuzya-tts:rocm` and does not overwrite the NVIDIA tags. Open WebUI and nginx stay the same.
+
+Default AMD base is `rocm/dev-ubuntu-24.04:7.2.4` with PyTorch nightly `rocm7.2`. To use AMD's image that already contains PyTorch, edit `BASE_IMAGE` / `TORCH_INDEX_URL` in `docker-compose.amd.yml`:
+
+```yaml
+BASE_IMAGE: rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.9.1
+TORCH_INDEX_URL: ""
+```
+
+If `group_add: render` fails, the container image has no `render` group — remove that line or pass the host GID. For GPUs that need a GFX override, uncomment `HSA_OVERRIDE_GFX_VERSION` in `docker-compose.amd.yml`.
+
+RDNA4 (`gfx1200` / `gfx1201`, including RX 9060 XT) needs `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` or PyTorch leaves flash attention off and F5-TTS runs a ~30× slower math kernel. That flag is already set in `docker-compose.amd.yml`. Recreate the container after pulling this change (`docker compose -f docker-compose.amd.yml up -d tts`).
 
 First STT start downloads Whisper into `models/whisper/` (turbo is ~1.6 GB). TTS warmup needs `models/voices/default/ref.wav`.
 
@@ -89,7 +132,11 @@ If audio settings in the UI disagree with `.env` after the first launch, Open We
 
 ### How to setup Kuzya
 
-Create new Workspace and specify system prompt from `system_prompt_kuzya.txt` and set voice to `kuzya_calm`, then save and pick it in your chat as the model.
+Create new Workspace and specify system prompt from `system_prompt_kuzya.txt`, and set voice to `kuzya_calm`.
+
+If you want to use Kuzya as voice assistant (in call mode to have minimal delays) - open `Advanced Params` and turn `enable_thinking` to Off position, so he will answer right away.
+
+Then save and pick it in your chat as the model.
 
 ## Smoke test
 
@@ -139,7 +186,7 @@ Open WebUI is built from `webui/Dockerfile`, which adds three Advanced Parameter
 
 Each control is Default / On / Off (or Default / xhigh / medium / low), same pattern as `keep_alive`. Default leaves the field out so vLLM uses its own defaults.
 
-First `docker compose up --build` rebuilds the Open WebUI frontend; later starts reuse `kuzya-open-webui:local`.
+First `docker compose -f docker-compose.nvidia.yml up --build` rebuilds the Open WebUI frontend; later starts reuse `kuzya-open-webui:local`.
 
 ## Ports
 

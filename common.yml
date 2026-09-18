@@ -1,70 +1,7 @@
-# STT + Open WebUI + F5-TTS on DGX Spark.
-# vLLM stays outside this compose and is reached via LLM_URL.
-#
-# GPU goes only to stt and tts. Open WebUI is CPU-only on purpose:
-# a third CUDA context would cost memory without helping the voice path.
+# CPU services and volumes. STT/TTS GPU wiring lives in
+# docker-compose.nvidia.yml (NVIDIA) or docker-compose.amd.yml (ROCm).
 
 services:
-  stt:
-    build: ./stt
-    ports:
-      - "8001:8001"
-    env_file:
-      - .env
-    environment:
-      NVIDIA_VISIBLE_DEVICES: all
-      NVIDIA_DRIVER_CAPABILITIES: compute,utility
-      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
-    volumes:
-      - ./models:/app/models
-      - ./stt/main.py:/app/main.py
-      - hf_cache:/root/.cache/huggingface
-    shm_size: "2gb"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 10m
-
-  tts:
-    build: ./tts
-    ports:
-      - "8002:8002"
-    env_file:
-      - .env
-    environment:
-      NVIDIA_VISIBLE_DEVICES: all
-      NVIDIA_DRIVER_CAPABILITIES: compute,utility
-      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
-    volumes:
-      - ./models:/app/models
-      - ./tts/main.py:/app/main.py
-      - hf_cache:/root/.cache/huggingface
-    shm_size: "2gb"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 8m
-
   open-webui:
     build: ./webui
     image: kuzya-open-webui:local
@@ -73,7 +10,7 @@ services:
     env_file:
       - .env
     environment:
-      # DGX OS often uses nvidia as the default runtime; keep WebUI off the GPU.
+      # Harmless on AMD. On DGX OS the default runtime is often nvidia.
       NVIDIA_VISIBLE_DEVICES: void
       ENABLE_OLLAMA_API: "false"
       ENABLE_OPENAI_API: "true"

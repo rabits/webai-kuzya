@@ -13,8 +13,83 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
+
+
+def _prefer_blocking_gpu_wait() -> str:
+    """ROCm HIP busy-spins one CPU core after the first GPU op (AsyncEventsLoop).
+
+    hipSetDeviceFlags(BlockingSync) MUST run before `import torch`. Calling it
+    afterwards still returns rc=0 but the spinner is already live.
+    HIP_SCHEDULE=off|spin|yield|blocking (default blocking).
+    """
+    import ctypes
+    import glob
+
+    choice = os.environ.get("HIP_SCHEDULE", "blocking").strip().lower()
+    flags = {"auto": 0, "spin": 1, "yield": 2, "blocking": 4}
+    if choice in {"off", "0", "none"}:
+        return "skipped"
+    value = flags.get(choice, 4)
+    candidates = glob.glob("/opt/venv/lib/python*/site-packages/torch/lib/libamdhip64.so")
+    candidates.extend(
+        (
+            "libamdhip64.so",
+            "/opt/rocm/lib/libamdhip64.so",
+            "/opt/rocm/lib64/libamdhip64.so",
+        )
+    )
+    for soname in candidates:
+        try:
+            hip = ctypes.CDLL(soname, mode=ctypes.RTLD_GLOBAL)
+        except OSError:
+            continue
+        fn = getattr(hip, "hipSetDeviceFlags", None)
+        if fn is None:
+            continue
+        fn.argtypes = [ctypes.c_uint]
+        fn.restype = ctypes.c_int
+        rc = fn(value)
+        return f"{soname} {choice}({value}) rc={rc}"
+    return "libamdhip64 not found"
+
+
+_GPU_WAIT_MODE = _prefer_blocking_gpu_wait()
+
+import torch
 from silero_stress import load_accentor
 from f5_tts.api import F5TTS
+
+
+def _patch_torchaudio_io() -> None:
+    """torchaudio 2.9+ routes load/save through torchcodec, which links CUDA (libnvrtc)."""
+    import soundfile as sf
+    import torch
+    import torchaudio
+
+    def load(uri, *args, **kwargs):
+        frame_offset = int(kwargs.get("frame_offset", 0) or 0)
+        num_frames = kwargs.get("num_frames", -1)
+        frames = -1 if num_frames in (-1, None) else int(num_frames)
+        data, sr = sf.read(
+            str(uri),
+            dtype="float32",
+            always_2d=True,
+            start=frame_offset,
+            frames=frames,
+        )
+        return torch.from_numpy(np.ascontiguousarray(data.T)), sr
+
+    def save(uri, src, sample_rate, *args, **kwargs):
+        arr = src.detach().cpu().numpy()
+        if arr.ndim == 2:
+            arr = arr.T
+        sf.write(str(uri), arr, int(sample_rate))
+
+    torchaudio.load = load
+    torchaudio.save = save
+
+
+_patch_torchaudio_io()
 
 
 F5_MODEL_NAME   = os.getenv("F5_MODEL_NAME",   "F5TTS_v1_Base")
@@ -23,6 +98,7 @@ F5_VOCAB_PATH   = os.getenv("F5_VOCAB_PATH",   "/app/models/f5tts-russian/vocab.
 VOICES_DIR      = os.getenv("VOICES_DIR",      "/app/models/voices")
 DEFAULT_VOICE   = os.getenv("DEFAULT_VOICE",   "default")
 TTS_MODEL_ID    = os.getenv("TTS_MODEL",       "f5-tts")
+F5_NFE_STEP     = int(os.getenv("F5_NFE_STEP", "32"))
 
 ResponseFormat = Literal["mp3", "opus", "aac", "flac", "wav", "pcm"]
 
@@ -69,21 +145,52 @@ def list_voice_names() -> list[str]:
     ]
 
 
-def _require_cuda() -> None:
+def _require_gpu() -> None:
     import torch
 
-    print(f"   torch {torch.__version__} cuda={torch.cuda.is_available()}")
-    if not torch.cuda.is_available():
+    ver = torch.__version__
+    available = torch.cuda.is_available()
+    print(f"   torch {ver} gpu={available}")
+    if not available:
+        if "rocm" not in ver.lower():
+            raise RuntimeError(
+                f"PyTorch cannot see a GPU ({ver} looks like CUDA). "
+                "AMD: docker compose -f docker-compose.amd.yml build --no-cache stt tts"
+            )
         raise RuntimeError(
-            "PyTorch was installed without CUDA. On DGX Spark install torch from "
-            "https://download.pytorch.org/whl/cu130/ (see tts/Dockerfile)."
+            f"PyTorch cannot see a GPU ({ver}). "
+            "Check /dev/kfd, /dev/dri, HIP_VISIBLE_DEVICES, and HSA_OVERRIDE_GFX_VERSION."
         )
-    print(f"   torch device: {torch.cuda.get_device_name(0)} cap={torch.cuda.get_device_capability(0)}")
+    extra = ""
+    try:
+        extra = f" cap={torch.cuda.get_device_capability(0)}"
+    except Exception:
+        pass
+    print(f"   torch device: {torch.cuda.get_device_name(0)}{extra}")
+    print(f"   hip wait: {_GPU_WAIT_MODE}")
+    if "rocm" in ver.lower() and os.environ.get("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL") != "1":
+        print(
+            "   WARNING: TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL is unset; "
+            "RDNA4 flash attention stays off and F5-TTS uses the slow math kernel."
+        )
 
 
-def _release_cuda() -> None:
+def _configure_cpu_threads() -> None:
     import torch
 
+    n = max(1, int(os.getenv("OMP_NUM_THREADS", "4")))
+    torch.set_num_threads(n)
+    torch.set_num_interop_threads(min(n, 4))
+    print(f"   torch cpu threads: {torch.get_num_threads()}")
+
+
+def _release_gpu(*, trim: bool = False) -> None:
+    import torch
+
+    # hipFree/empty_cache on every request is expensive on ROCm and does not
+    # help latency. Only return cached blocks when the process is going away.
+    if not trim:
+        return
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -149,14 +256,18 @@ def synthesize(text: str, voice: str, speed: float, accentuate: bool) -> bytes:
         ref_text=ref_text,
         gen_text=gen_text,
         speed=speed,
+        nfe_step=F5_NFE_STEP,
+        progress=None,
+        show_info=lambda *_args, **_kwargs: None,
     )
     return wav_bytes(audio, sr)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("⏳ Checking CUDA...")
-    _require_cuda()
+    print("⏳ Checking GPU...")
+    _configure_cpu_threads()
+    _require_gpu()
 
     print("⏳ Loading silero-stress...")
     models["accentor"] = load_accentor()
@@ -171,12 +282,11 @@ async def lifespan(app: FastAPI):
 
     print("⏳ Warming up F5-TTS...")
     await asyncio.to_thread(synthesize, "Привет.", DEFAULT_VOICE, 1.0, True)
-    _release_cuda()
 
     print("✅ TTS ready")
     yield
     models.clear()
-    _release_cuda()
+    _release_gpu(trim=True)
 
 
 app = FastAPI(title="F5-TTS", lifespan=lifespan)
@@ -261,12 +371,9 @@ async def audio_speech(req: SpeechRequest):
         raise HTTPException(status_code=400, detail=openai_error("input is empty", param="input"))
 
     async with infer_lock:
-        try:
-            wav = await asyncio.to_thread(
-                synthesize, text, req.voice, float(req.speed), req.accentuate,
-            )
-        finally:
-            _release_cuda()
+        wav = await asyncio.to_thread(
+            synthesize, text, req.voice, float(req.speed), req.accentuate,
+        )
 
     body, media = encode_audio(wav, req.response_format)
     return Response(content=body, media_type=media)

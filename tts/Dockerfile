@@ -1,7 +1,13 @@
-# F5-TTS service for DGX Spark (aarch64, CUDA 13).
-# torch/torchaudio must come from the cu130 index, not default PyPI.
+# F5-TTS. Platform torch comes from compose build args, not PyPI.
+# NVIDIA: docker-compose.nvidia.yml (cu130). AMD: docker-compose.amd.yml (ROCm).
 
-FROM nvidia/cuda:13.3.1-cudnn-runtime-ubuntu24.04
+ARG BASE_IMAGE=nvidia/cuda:13.3.1-cudnn-runtime-ubuntu24.04
+FROM ${BASE_IMAGE}
+
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu130/
+ARG PIP_EXTRA_FLAGS=""
+ARG TORCH_PACKAGES="torch torchaudio"
+ARG GPU_FLAVOR=nvidia
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -17,12 +23,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 COPY requirements.txt ./
 
+# f5-tts pulls torch from PyPI (CUDA). Install the platform wheel first, then
+# re-assert it after requirements so pip cannot keep a +cu wheel as "satisfied".
 RUN python3 -m venv /opt/venv \
     && /opt/venv/bin/pip install --upgrade pip \
+    && if [ -n "${TORCH_INDEX_URL}" ]; then \
+         echo "torch from ${TORCH_INDEX_URL} (${GPU_FLAVOR})"; \
+         /opt/venv/bin/pip install ${PIP_EXTRA_FLAGS} ${TORCH_PACKAGES} \
+           --index-url "${TORCH_INDEX_URL}"; \
+       fi \
     && /opt/venv/bin/pip install -r requirements.txt \
-    && /opt/venv/bin/pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu130/ \
+    && if [ -n "${TORCH_INDEX_URL}" ]; then \
+         /opt/venv/bin/pip install ${PIP_EXTRA_FLAGS} --force-reinstall --no-deps \
+           ${TORCH_PACKAGES} --index-url "${TORCH_INDEX_URL}"; \
+       fi \
+    && /opt/venv/bin/pip uninstall -y torchcodec || true \
     && /opt/venv/bin/pip install 'numpy>=1.26,<2' \
-    && /opt/venv/bin/python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
+    && /opt/venv/bin/python -c "\
+import sys, torch; v=torch.__version__; print('torch', v, 'hip', getattr(torch.version,'hip',None)); \
+flavor='${GPU_FLAVOR}'; \
+sys.exit('expected ROCm torch, got '+v) if flavor=='rocm' and 'rocm' not in v.lower() else None; \
+sys.exit('expected CUDA torch, got '+v) if flavor=='nvidia' and 'rocm' in v.lower() else None"
 
 COPY main.py entrypoint.sh ./
 RUN chmod +x /app/entrypoint.sh

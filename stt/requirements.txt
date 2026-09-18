@@ -4,4 +4,4 @@ pydantic>=2.0
 python-multipart>=0.0.9
 numpy>=1.26,<2
 openai-whisper>=20240930
-# torch/torchaudio are installed from the cu130 index in the Dockerfile.
+# torch/torchaudio are installed from the compose TORCH_INDEX_URL in the Dockerfile.
