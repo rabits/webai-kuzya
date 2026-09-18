@@ -19,65 +19,24 @@ vLLM is intentionally not in this compose file. It already owns most of the 128 
 
 The idea of f5-tts with stress marks I got from https://github.com/korenko-git/voice-service - thanks to Dmytro it works great!
 
-## Why three containers, not one
-
-Docker itself is cheap: a few hundred MB of process overhead. What actually costs memory on GB10 is:
-
-| Consumer | Typical resident | Notes |
-| --- | --- | --- |
-| vLLM | tens of GB | KV cache + weights. Set `--gpu-memory-utilization` with headroom. |
-| F5-TTS | ~3–5 GB | One CUDA context + weights |
-| Whisper turbo | ~2 GB | One CUDA context + weights |
-| Open WebUI | ~1 GB CPU | Must not get a GPU |
-| Two extra CUDA contexts vs one merged speech process | ~1–2 GB | Not worth coupling STT and TTS for this |
-
-Merging Whisper and F5-TTS into one process would save roughly one CUDA context and one copy of `libtorch`. That is noise next to vLLM. Separate services keep the existing TTS image, let STT and TTS restart independently, and match Open WebUI’s two OpenAI-compatible audio URLs.
-
-The setting that *does* starve this stack is vLLM grabbing the whole unified memory pool. Leave about 16–24 GB for OS + STT + TTS, for example:
-
-```bash
-vllm serve "$LLM_MODEL" \
-  --host 0.0.0.0 \
-  --port 8000 \
-  --gpu-memory-utilization 0.75
-```
-
-Start STT/TTS before a tight vLLM process, or lower utilization if either speech container OOMs.
-
-Do **not** use Open WebUI’s built-in Whisper or the `:cuda` WebUI image here. Built-in faster-whisper is CPU-only on aarch64 (CTranslate2 has no CUDA ARM wheels), and a GPU WebUI image would open a third CUDA context for no benefit.
-
 ## Prerequisites
 
 NVIDIA (default):
-
 - DGX Spark (GB10, aarch64, CUDA 13) or any NVIDIA box with the NVIDIA Container Toolkit
 - Do not set `runtime: nvidia` on DGX OS; use `deploy.resources` GPU reservations
 
 AMD:
-
 - ROCm 7.2.x, `/dev/kfd` and `/dev/dri`, host groups `video` / `render`
-- `docker compose -f docker-compose.amd.yml` (see [AMD ROCm](#amd-rocm))
 
 Both:
-
 - F5-TTS files and a `default` voice as described in [models/README.md](models/README.md)
 - vLLM already serving an OpenAI-compatible API
 
-## Run
+## Usage
 
-As LLM you can use any setup that supports OpenAI protocol. I use https://github.com/blazux/qwen3.8-Flash-DGX as vLLM:
-```
-$ ./flash setup
-$ ./flash serve PORT=8000
-$ PORT=8000 ./flash wait
-```
+You need just to copy the env, configure it and run the fitting to you compose file.
 
-**WARNING**: With default model it will run just fine on one DGX Spark, but with custom model it will not fit RAM. So with that I use second host for STT and TTS:
-```
-$ MODEL=lychee888/Qwen3.8-Flash-Next-Uncensored-NVFP4-FP8PLE ./flash setup
-$ MODEL=lychee888/Qwen3.8-Flash-Next-Uncensored-NVFP4-FP8PLE ./flash serve published PORT=8000
-$ PORT=8000 ./flash wait
-```
+### DGX Spark / Nvidia
 
 ```bash
 cp .env.example .env
@@ -87,48 +46,42 @@ cp .env.example .env
 docker compose -f docker-compose.nvidia.yml up -d --build
 ```
 
-## AMD ROCm
+### LLM setup
 
-GPU device wiring cannot be a `.env` switch: Compose merges `devices` / `deploy` instead of replacing them. Use the AMD compose file. Platform images and torch indexes live in that file, not in `.env`.
+You need to run LLM separately, by default on 8000 port and support OpenAI protocol.
 
-```bash
-docker compose -f docker-compose.amd.yml build --no-cache stt tts
-docker compose -f docker-compose.amd.yml up -d --build
+#### Qwen 3.8 27B Uncensored
+
+On DGX Spark I think it's a good choise to have quick responses for voice assistant, but not much to reasoning.
+
+```
+$ docker run -d --name qwen38-27b --gpus all --ipc=host -p 8000:8000 \
+    -v "$HOME/.cache/huggingface:/hf" -e HF_HOME=/hf \
+    vllm/vllm-openai:qwen38-flash-next \
+    --model lfitoto/Qwen3.8-27B-Uncensored-NVFP4 --served-model-name qwen3.8-27B \
+    --kv-cache-dtype fp8 --gpu-memory-utilization 0.7 --max-model-len 262144 \
+    --max-num-seqs 8 --max-num-batched-tokens 8192 --enable-chunked-prefill --async-scheduling \
+    --enable-prefix-caching --load-format fastsafetensors --tensor-parallel-size 1 \
+    --enable-auto-tool-choice --tool-call-parser qwen3_xml --reasoning-parser qwen3 --mm-encoder-tp-mode data
 ```
 
-`--no-cache` is needed if an earlier AMD build left CUDA torch in the image: `whisper` / `f5-tts` pull `torch` from PyPI, which is a `+cu*` wheel. The Dockerfiles now install the ROCm wheel first and force-reinstall it after requirements.
+#### Qwen 3.8 Flash Next
 
-That builds `kuzya-stt:rocm` / `kuzya-tts:rocm` and does not overwrite the NVIDIA tags. Open WebUI and nginx stay the same.
-
-Default AMD base is `rocm/dev-ubuntu-24.04:7.2.4` with PyTorch nightly `rocm7.2`. To use AMD's image that already contains PyTorch, edit `BASE_IMAGE` / `TORCH_INDEX_URL` in `docker-compose.amd.yml`:
-
-```yaml
-BASE_IMAGE: rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.9.1
-TORCH_INDEX_URL: ""
+I use https://github.com/blazux/qwen3.8-Flash-DGX as vLLM - by default it fits to DGX Spark and allows to run all the components as side-services:
+```
+$ ./flash setup
+$ ./flash serve PORT=8000
+$ PORT=8000 ./flash wait
 ```
 
-If `group_add: render` fails, the container image has no `render` group — remove that line or pass the host GID. For GPUs that need a GFX override, uncomment `HSA_OVERRIDE_GFX_VERSION` in `docker-compose.amd.yml`.
+#### Qwen 3.8 Flash Next Uncensored
 
-RDNA4 (`gfx1200` / `gfx1201`, including RX 9060 XT) needs `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` or PyTorch leaves flash attention off and F5-TTS runs a ~30× slower math kernel. That flag is already set in `docker-compose.amd.yml`. Recreate the container after pulling this change (`docker compose -f docker-compose.amd.yml up -d tts`).
-
-First STT start downloads Whisper into `models/whisper/` (turbo is ~1.6 GB). TTS warmup needs `models/voices/default/ref.wav`.
-
-Open **https://localhost** (or your `WEBUI_URL`). HTTP on port 80 redirects to HTTPS.
-
-On first start nginx writes a self-signed cert into `certs/` for the host in `WEBUI_URL`. Browsers will warn until you accept it, or until you drop a real cert there:
-
-```bash
-# Let's Encrypt live directory, or any dir with these filenames
-# TLS_CERT_DIR=/etc/letsencrypt/live/example.com
-# TLS_CERT=fullchain.pem
-# TLS_KEY=privkey.pem
+https://github.com/blazux/qwen3.8-Flash-DGX - with custom model it will not fit DGX Spark RAM. So with that I use second host for STT and TTS:
 ```
-
-A non-443 port in `WEBUI_URL` (for example `https://example.com:8443`) is used in the redirect and in the cert marker. Nginx inside the container still listens on 443; map the host port in compose (`"8443:443"`) if you actually want that port on the host.
-
-Changing `WEBUI_URL` regenerates the self-signed pair only if `certs/.selfsigned-for` is present (i.e. nginx created the files). Your own certs are never overwritten. To force a new self-signed cert, delete `certs/*.pem` and `certs/.selfsigned-for` and recreate `lb`.
-
-If audio settings in the UI disagree with `.env` after the first launch, Open WebUI persisted them in its volume. Either set Admin → Settings → Audio, or recreate the `open-webui-data` volume.
+$ MODEL=lychee888/Qwen3.8-Flash-Next-Uncensored-NVFP4-FP8PLE ./flash setup
+$ MODEL=lychee888/Qwen3.8-Flash-Next-Uncensored-NVFP4-FP8PLE ./flash serve published PORT=8000
+$ PORT=8000 ./flash wait
+```
 
 ### How to setup Kuzya
 
@@ -138,33 +91,11 @@ If you want to use Kuzya as voice assistant (in call mode to have minimal delays
 
 Then save and pick it in your chat as the model.
 
-## Smoke test
+## Open WebUI
 
-```bash
-chmod +x scripts/smoke.sh
-./scripts/smoke.sh
-```
+After setup you can visit **https://localhost** (or your `WEBUI_URL`) to see the UI.
 
-This checks `/health` on STT, TTS, local WebUI, and HTTPS via nginx, then transcribes `models/voices/default/ref.wav` if it exists.
-
-Manual checks:
-
-```bash
-curl -s http://127.0.0.1:8001/health
-curl -s http://127.0.0.1:8002/health
-curl -s http://127.0.0.1:8002/v1/audio/voices
-
-curl -s http://127.0.0.1:8001/v1/audio/transcriptions \
-  -F file=@models/voices/default/ref.wav \
-  -F language=ru
-
-curl -s http://127.0.0.1:8002/v1/audio/speech \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"f5-tts","input":"Привет, это проверка.","voice":"default","response_format":"mp3"}' \
-  --output /tmp/kuzya.mp3
-```
-
-## Voice chat in Open WebUI
+### Voice chat
 
 Admin → Settings → Audio should already be seeded from compose:
 
@@ -174,7 +105,7 @@ Admin → Settings → Audio should already be seeded from compose:
 
 Then use the microphone / call controls in a chat against the vLLM model.
 
-## Qwen 3.8 thinking options
+### Qwen 3.8 thinking options
 
 Open WebUI is built from `webui/Dockerfile`, which adds three Advanced Parameters (workspace model defaults and chat overrides):
 
@@ -187,14 +118,3 @@ Open WebUI is built from `webui/Dockerfile`, which adds three Advanced Parameter
 Each control is Default / On / Off (or Default / xhigh / medium / low), same pattern as `keep_alive`. Default leaves the field out so vLLM uses its own defaults.
 
 First `docker compose -f docker-compose.nvidia.yml up --build` rebuilds the Open WebUI frontend; later starts reuse `kuzya-open-webui:local`.
-
-## Ports
-
-| Service | Port | Bind |
-| --- | --- | --- |
-| nginx HTTP → HTTPS | 80 | public |
-| nginx HTTPS | 443 | public |
-| Open WebUI | 3000 | `127.0.0.1` only |
-| STT | 8001 | host (docker network for WebUI) |
-| TTS | 8002 | host (docker network for WebUI) |
-| vLLM (external) | 8000 by default | |
