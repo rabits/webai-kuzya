@@ -6,7 +6,7 @@ Open WebUI in front of an external vLLM endpoint, with local Whisper STT and F5-
 Browser
    │
    ▼
-lb (nginx)          :80 → :443, TLS
+ nginx          :80 → :443, TLS
    │
    ▼
 open-webui          127.0.0.1:3000, CPU only, ~1 GB
@@ -94,6 +94,15 @@ Then save and pick it in your chat as the model.
 ## Open WebUI
 
 After setup you can visit **https://localhost** (or your `WEBUI_URL`) to see the UI.
+
+### Nginx
+
+You need a way to proxy 443 port to Open-WebUI because mic will work only on HTTPS. For that you can use:
+* [WebAI-Router](https://github.com/rabits/webai-router) - special system to automate switch between different configurations
+* System nginx server - Install nginx, use nginx.example.conf and generate self-singned certs using the next command:
+   ```
+   $ sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout /etc/ssl/private/openwebui.key -out /etc/ssl/certs/openwebui.crt
+   ```
 
 ### Voice chat
 
